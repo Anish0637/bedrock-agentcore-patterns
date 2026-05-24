@@ -1,114 +1,109 @@
 """
 Pattern 1 — AI Agent with Bedrock AgentCore Runtime
 ====================================================
-Deploys a Strands-based agent (with custom tools) to AgentCore Runtime.
-The BedrockAgentCoreApp wrapper auto-creates /invocations and /ping HTTP
-endpoints expected by the runtime.
-
-Usage (local):
-    python agent.py
-
-Deploy to AgentCore Runtime:
-    python deploy.py
+Uses boto3 Bedrock Converse API + stdlib HTTPServer.
+Dependencies (boto3) are bundled in the lib/ directory within the zip.
 """
 
-import os
 import json
 import logging
-from datetime import datetime
+import os
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from dotenv import load_dotenv
-from strands import Agent, tool
-from strands_tools import calculator
-from strands.models import BedrockModel
-from bedrock_agentcore.runtime import BedrockAgentCoreApp
+# Add bundled lib/ directory (vendored dependencies in the zip)
+_bundle_lib = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
+if os.path.isdir(_bundle_lib):
+    sys.path.insert(0, _bundle_lib)
 
-load_dotenv()
+import boto3
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
 MODEL_ID = os.getenv("MODEL_ID", "us.anthropic.claude-3-7-sonnet-20250219-v1:0")
+REGION   = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
 
-# ── Custom tools ──────────────────────────────────────────────────────────────
+# Session header forwarded by AgentCore runtime
+SESSION_HEADER = "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id"
 
-@tool
-def get_current_time() -> str:
-    """Return the current UTC date and time."""
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-
-
-@tool
-def get_weather(city: str) -> str:
-    """Return a mock weather report for the given city.
-
-    Args:
-        city: Name of the city to get weather for.
-    """
-    mock_weather = {
-        "seattle": "🌧 Rainy, 12°C",
-        "new york": "⛅ Partly cloudy, 22°C",
-        "los angeles": "☀️ Sunny, 28°C",
-    }
-    return mock_weather.get(city.lower(), f"Weather data unavailable for {city}")
+# In-memory conversation history keyed by session ID
+_sessions: dict[str, list] = {}
+_sessions_lock = threading.Lock()
 
 
-@tool
-def unit_converter(value: float, from_unit: str, to_unit: str) -> str:
-    """Convert between common units (km/miles, celsius/fahrenheit, kg/lbs).
+def _call_bedrock(session_id: str, prompt: str) -> str:
+    """Call Bedrock Converse API with full session history and return text."""
+    client = boto3.client("bedrock-runtime", region_name=REGION)
 
-    Args:
-        value: Numeric value to convert.
-        from_unit: Source unit (km, miles, c, f, kg, lbs).
-        to_unit: Target unit (km, miles, c, f, kg, lbs).
-    """
-    conversions = {
-        ("km", "miles"): lambda v: v * 0.621371,
-        ("miles", "km"): lambda v: v * 1.60934,
-        ("c", "f"): lambda v: v * 9 / 5 + 32,
-        ("f", "c"): lambda v: (v - 32) * 5 / 9,
-        ("kg", "lbs"): lambda v: v * 2.20462,
-        ("lbs", "kg"): lambda v: v * 0.453592,
-    }
-    key = (from_unit.lower(), to_unit.lower())
-    if key in conversions:
-        result = conversions[key](value)
-        return f"{value} {from_unit} = {result:.4f} {to_unit}"
-    return f"Conversion from {from_unit} to {to_unit} is not supported."
+    # Retrieve or init history for this session
+    with _sessions_lock:
+        history = _sessions.setdefault(session_id, [])
+        history.append({"role": "user", "content": [{"text": prompt}]})
+        messages = list(history)  # snapshot
 
+    resp = client.converse(
+        modelId=MODEL_ID,
+        messages=messages,
+        system=[{"text": (
+            "You are a helpful assistant. "
+            "For arithmetic questions, give just the numeric answer. "
+            "Remember everything the user tells you within this conversation."
+        )}],
+    )
+    reply = resp["output"]["message"]["content"][0]["text"]
 
-# ── AgentCore App ─────────────────────────────────────────────────────────────
+    with _sessions_lock:
+        _sessions[session_id].append({"role": "assistant", "content": [{"text": reply}]})
 
-app = BedrockAgentCoreApp()
-
-model = BedrockModel(model_id=MODEL_ID)
-
-agent = Agent(
-    model=model,
-    tools=[calculator, get_current_time, get_weather, unit_converter],
-    system_prompt=(
-        "You are a helpful assistant. You can perform calculations, tell the time, "
-        "report the weather, and convert units. Always use the appropriate tool when possible."
-    ),
-)
-
-
-@app.entrypoint
-def invoke(payload: dict) -> str:
-    """Main entrypoint — receives JSON payload, returns text response."""
-    user_input = payload.get("prompt", "")
-    logger.info("Received prompt: %s", user_input)
-
-    if not user_input:
-        return json.dumps({"error": "Missing 'prompt' in payload"})
-
-    response = agent(user_input)
-    reply = response.message["content"][0]["text"]
-    logger.info("Agent reply: %s", reply[:120])
     return reply
 
 
-# ── Local runner ──────────────────────────────────────────────────────────────
+class AgentHandler(BaseHTTPRequestHandler):
+    """Minimal HTTP handler implementing /ping and /invocations."""
+
+    def do_GET(self):
+        if self.path == "/ping":
+            self._respond(200, {"status": "healthy"})
+        else:
+            self._respond(404, {"error": "not found"})
+
+    def do_POST(self):
+        if self.path == "/invocations":
+            length = int(self.headers.get("Content-Length", 0))
+            payload = json.loads(self.rfile.read(length) if length else b"{}")
+            prompt = payload.get("prompt", "")
+            session_id = self.headers.get(SESSION_HEADER) or "default"
+            logger.info("Session=%s prompt=%s", session_id[:12], prompt)
+            if not prompt:
+                self._respond(400, {"error": "Missing 'prompt'"})
+                return
+            try:
+                reply = _call_bedrock(session_id, prompt)
+                logger.info("Reply: %s", reply[:80])
+                self._respond(200, {"response": reply, "raw": reply})
+            except Exception as e:
+                logger.exception("Bedrock error")
+                self._respond(500, {"error": str(e)})
+        else:
+            self._respond(404, {"error": "not found"})
+
+    def _respond(self, code: int, data: dict):
+        body = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):  # suppress default access logs
+        logger.debug(fmt, *args)
+
 
 if __name__ == "__main__":
-    app.run()
+    port = int(os.getenv("PORT", "8080"))
+    logger.info("Starting AgentCore HTTP server on 0.0.0.0:%d", port)
+    server = HTTPServer(("0.0.0.0", port), AgentHandler)
+    server.serve_forever()
+

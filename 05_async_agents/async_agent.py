@@ -1,9 +1,8 @@
 """
 Pattern 5 — Asynchronous & Long-Running Agents
 ===============================================
-Demonstrates the @app.async_task decorator pattern.
-The agent immediately acknowledges the request and processes
-a background task — the /ping status reports HealthyBusy until done.
+Demonstrates async task tracking with stdlib ThreadingHTTPServer + boto3.
+Dependencies (boto3) are bundled in the lib/ directory within the zip.
 
 Usage (local):
     python async_agent.py
@@ -12,38 +11,33 @@ Deploy to AgentCore Runtime:
     python deploy.py
 """
 
-import os
-import asyncio
-import logging
 import json
+import logging
+import os
+import sys
+import threading
 import time
-from datetime import datetime
-from dotenv import load_dotenv
-from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
+# Add bundled lib/ directory (vendored dependencies in the zip)
+_bundle_lib = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
+if os.path.isdir(_bundle_lib):
+    sys.path.insert(0, _bundle_lib)
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-app = BedrockAgentCoreApp()
+HOST, PORT = "0.0.0.0", 8080
 
-# Shared task results store (in-memory; use DynamoDB / ElastiCache in production)
-task_store: dict[str, dict] = {}
+# Shared in-memory task store (use DynamoDB in production)
+_task_store: dict[str, dict] = {}
+_task_lock = threading.Lock()
 
 
-# ── Background task ────────────────────────────────────────────────────────────
-
-@app.async_task
-async def long_running_analysis(task_id: str, data_points: int):
-    """
-    Simulate a long-running data analysis job.
-    While this coroutine is running, /ping returns HealthyBusy so the
-    runtime knows the session is still active.
-    """
+def _run_analysis(task_id: str, data_points: int):
+    """Background thread: simulate a multi-stage analysis job."""
     logger.info("[%s] Analysis started — %d data points", task_id, data_points)
-    task_store[task_id] = {"status": "running", "progress": 0, "started_at": datetime.utcnow().isoformat()}
-
-    # Simulate work in stages
     stages = [
         ("Loading data",        20),
         ("Preprocessing",       40),
@@ -51,57 +45,77 @@ async def long_running_analysis(task_id: str, data_points: int):
         ("Generating report",   90),
         ("Finalizing results", 100),
     ]
-
     for stage_name, progress in stages:
-        await asyncio.sleep(3)   # Simulate I/O-bound work
-        task_store[task_id]["progress"] = progress
-        task_store[task_id]["current_stage"] = stage_name
+        time.sleep(2)  # Simulate work
+        with _task_lock:
+            _task_store[task_id].update({"progress": progress, "current_stage": stage_name})
         logger.info("[%s] %s — %d%%", task_id, stage_name, progress)
 
-    task_store[task_id].update({
-        "status": "completed",
-        "result": f"Analysis of {data_points} data points finished successfully.",
-        "finished_at": datetime.utcnow().isoformat(),
-    })
+    with _task_lock:
+        _task_store[task_id].update({
+            "status": "completed",
+            "result": f"Analysis of {data_points} data points finished.",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        })
     logger.info("[%s] Analysis completed!", task_id)
 
 
-# ── Entrypoint ────────────────────────────────────────────────────────────────
+class AsyncAgentHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/ping", "/health"):
+            self._respond(200, {"status": "healthy"})
+        else:
+            self._respond(404, {"error": "not found"})
 
-@app.entrypoint
-async def handler(payload: dict) -> dict:
-    """
-    Immediately returns an acknowledgement, then kicks off the background task.
-    The same session can be polled with action=status to check progress.
-    """
-    action = payload.get("action", "start")
+    def do_POST(self):
+        if self.path == "/invocations":
+            length = int(self.headers.get("Content-Length", 0))
+            payload = json.loads(self.rfile.read(length) if length else b"{}")
+            action = payload.get("action", "start")
 
-    if action == "start":
-        task_id = payload.get("task_id", f"task-{int(time.time())}")
-        data_points = int(payload.get("data_points", 1000))
+            if action == "start":
+                task_id = payload.get("task_id", f"task-{int(time.time())}")
+                data_points = int(payload.get("data_points", 1000))
+                with _task_lock:
+                    _task_store[task_id] = {
+                        "status": "running",
+                        "progress": 0,
+                        "started_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                t = threading.Thread(target=_run_analysis, args=(task_id, data_points), daemon=True)
+                t.start()
+                self._respond(200, {
+                    "status": "accepted",
+                    "task_id": task_id,
+                    "message": f"Analysis of {data_points} data points started.",
+                    "raw": "accepted",
+                })
 
-        # Fire and forget — async_task decorator tracks /ping HealthyBusy status
-        asyncio.create_task(long_running_analysis(task_id, data_points))
+            elif action == "status":
+                task_id = payload.get("task_id")
+                with _task_lock:
+                    result = dict(_task_store.get(task_id, {"status": "not_found"}))
+                result["raw"] = result.get("status", "unknown")
+                self._respond(200, result)
 
-        return {
-            "status": "accepted",
-            "task_id": task_id,
-            "message": (
-                f"Analysis of {data_points} data points started. "
-                "Poll with action=status to check progress."
-            ),
-        }
+            else:
+                self._respond(400, {"error": f"Unknown action: {action}"})
+        else:
+            self._respond(404, {"error": "not found"})
 
-    elif action == "status":
-        task_id = payload.get("task_id")
-        if not task_id or task_id not in task_store:
-            return {"status": "not_found", "task_id": task_id}
-        return task_store[task_id]
+    def _respond(self, code: int, data: dict):
+        body = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-    return {"error": f"Unknown action: {action}"}
+    def log_message(self, fmt, *args):
+        logger.debug(fmt, *args)
 
-
-# ── Local runner ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    app.run()
+    logger.info("Starting Async Agent server on %s:%d", HOST, PORT)
+    server = ThreadingHTTPServer((HOST, PORT), AsyncAgentHandler)
+    server.serve_forever()
