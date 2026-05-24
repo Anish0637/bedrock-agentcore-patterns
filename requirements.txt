@@ -1,0 +1,30 @@
+# core AWS + AgentCore SDK
+boto3>=1.38.0
+bedrock-agentcore>=0.1.0
+bedrock-agentcore-strands>=0.1.0
+
+# Strands Agent framework
+strands-agents>=0.1.0
+strands-agents-tools>=0.1.0
+
+# MCP
+mcp[cli]>=1.0.0
+fastmcp>=0.1.0
+
+# A2A
+a2a-sdk>=0.2.0
+
+# Web server
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+httpx>=0.27.0
+requests>=2.32.0
+starlette>=0.41.0
+
+# Async / utility
+python-dotenv>=1.0.0
+pydantic>=2.9.0
+
+# Dev / deploy helpers
+aws-cdk-lib>=2.170.0
+constructs>=10.4.0
