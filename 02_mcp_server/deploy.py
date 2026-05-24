@@ -1,43 +1,22 @@
 """
 Pattern 2 — Deploy MCP Server to AgentCore Runtime
 """
-
 import os
-import boto3
+import sys
 import logging
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from dotenv import load_dotenv
-from bedrock_agentcore_control_plane import BedrockAgentCoreControlPlane
+from infra.deploy_helper import deploy_pattern
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
-logger = logging.getLogger(__name__)
 
-REGION = os.getenv("AWS_DEFAULT_REGION", "us-west-2")
-ACCOUNT_ID = os.getenv("AWS_ACCOUNT_ID")
-
-
-def deploy():
-    cp = BedrockAgentCoreControlPlane(region_name=REGION)
-    logger.info("Deploying MCP Server to AgentCore Runtime …")
-
-    response = cp.create_agent_runtime(
-        name="bedrock-agentcore-mcp-server",
-        description="Pattern 2: FastMCP server with math and utility tools",
-        source_directory=os.path.dirname(__file__),
-        entrypoint="mcp_server:mcp",
-        protocol="MCP",           # Tell AgentCore this is an MCP server
-        execution_role_arn=f"arn:aws:iam::{ACCOUNT_ID}:role/BedrockAgentCoreExecutionRole",
-        environment_variables={"AWS_DEFAULT_REGION": REGION},
-    )
-
-    runtime_arn = response["agentRuntimeArn"]
-    logger.info("MCP Server deployed. ARN: %s", runtime_arn)
-
-    print("\n✅ MCP Server deployed!")
-    print(f"   ARN: {runtime_arn}")
-    print("   Invoke via: POST /mcp with MCP JSON-RPC messages")
-    return runtime_arn
-
+PATTERN_DIR  = os.path.dirname(os.path.abspath(__file__))
+RUNTIME_NAME = "BedrockAgentCore_MCPServer"
+ENTRY_SCRIPT = "mcp_server.py"
 
 if __name__ == "__main__":
-    deploy()
+    arn = deploy_pattern(PATTERN_DIR, RUNTIME_NAME, ENTRY_SCRIPT)
+    print("\n✅ Pattern 02 MCP Server deployed!")
+    print(f"   ARN: {arn}")

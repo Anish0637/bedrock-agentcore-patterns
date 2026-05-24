@@ -141,11 +141,24 @@ def deploy_lambda(lambda_client, role_arn: str) -> str:
 
 
 def create_gateway(agentcore_client, name: str) -> str:
+    # Check if already exists
+    try:
+        existing = agentcore_client.list_gateways()
+        for gw in existing.get("items", []):
+            if gw["name"] == name:
+                gw_id = gw["gatewayId"]
+                logger.info("Gateway already exists: %s", gw_id)
+                return gw_id
+    except Exception:
+        pass
+
     try:
         resp = agentcore_client.create_gateway(
             name=name,
             description="Pattern 9: Gateway exposing Lambda order tools via MCP",
             roleArn=f"arn:aws:iam::{ACCOUNT_ID}:role/BedrockAgentCoreGatewayRole",
+            protocolType="MCP",
+            authorizerType="AWS_IAM",
         )
         gw_id = resp["gatewayId"]
         logger.info("Gateway created: %s", gw_id)
@@ -156,6 +169,17 @@ def create_gateway(agentcore_client, name: str) -> str:
 
 
 def register_lambda_target(agentcore_client, gateway_id: str, lambda_arn: str) -> str:
+    # Check if target already exists
+    try:
+        existing = agentcore_client.list_gateway_targets(gatewayIdentifier=gateway_id)
+        for t in existing.get("items", []):
+            if t["name"] == "OrderManagementTarget":
+                tid = t["targetId"]
+                logger.info("Target already exists: %s", tid)
+                return tid
+    except Exception:
+        pass
+
     target_config = {
         "mcp": {
             "lambda": {
@@ -180,7 +204,7 @@ def register_lambda_target(agentcore_client, gateway_id: str, lambda_arn: str) -
                                     "orderId": {"type": "string"},
                                     "status": {
                                         "type": "string",
-                                        "enum": ["pending", "processing", "shipped", "delivered", "cancelled"],
+                                        "description": "New status: pending, processing, shipped, delivered, or cancelled",
                                     },
                                 },
                                 "required": ["orderId", "status"],
@@ -194,7 +218,7 @@ def register_lambda_target(agentcore_client, gateway_id: str, lambda_arn: str) -
                                 "properties": {
                                     "statusFilter": {
                                         "type": "string",
-                                        "enum": ["pending", "processing", "shipped", "delivered", "cancelled"],
+                                        "description": "Filter by status: pending, processing, shipped, delivered, or cancelled",
                                     }
                                 },
                             },
@@ -212,7 +236,7 @@ def register_lambda_target(agentcore_client, gateway_id: str, lambda_arn: str) -
         targetConfiguration=target_config,
         credentialProviderConfigurations=[{"credentialProviderType": "GATEWAY_IAM_ROLE"}],
     )
-    target_id = resp["gatewayTargetId"]
+    target_id = resp["targetId"]
     logger.info("Gateway target registered: %s", target_id)
     return target_id
 
@@ -222,7 +246,7 @@ if __name__ == "__main__":
         print("⚠️  AWS_ACCOUNT_ID is not set.")
     else:
         lambda_client = boto3.client("lambda", region_name=REGION)
-        agentcore_client = boto3.client("bedrock-agentcore", region_name=REGION)
+        agentcore_client = boto3.client("bedrock-agentcore-control", region_name=REGION)
 
         lambda_role = f"arn:aws:iam::{ACCOUNT_ID}:role/BedrockAgentCoreLambdaRole"
         fn_arn = deploy_lambda(lambda_client, lambda_role)
